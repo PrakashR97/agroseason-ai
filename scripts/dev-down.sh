@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-cd "$(dirname "$0")/.."
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 for n in api worker web; do
-  [ -f .run/$n.pid ] && kill "$(cat .run/$n.pid)" 2>/dev/null && echo "stopped $n"; rm -f .run/$n.pid
+  if [ -f "$ROOT/.run/$n.pid" ]; then
+    pid=$(cat "$ROOT/.run/$n.pid"); pkill -P "$pid" 2>/dev/null; kill "$pid" 2>/dev/null && echo "stopped $n"
+    rm -f "$ROOT/.run/$n.pid"
+  fi
 done
+exit 0
