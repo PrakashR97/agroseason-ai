@@ -1,0 +1,34 @@
+# Production on a VPS that ALREADY runs Traefik. This file does not start or modify Traefik: it only
+# attaches api/web to the existing Traefik network and adds routing labels.
+# Required .env values: DOMAIN, TRAEFIK_NETWORK, TRAEFIK_ENTRYPOINT (default websecure),
+# TRAEFIK_CERTRESOLVER (name of the existing resolver). CORS_ORIGINS should be https://$DOMAIN.
+services:
+  api:
+    networks: [internal, traefik_public]
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=${TRAEFIK_NETWORK:?set TRAEFIK_NETWORK}
+      - traefik.http.routers.agroseason-api.rule=Host(`${DOMAIN:?set DOMAIN}`) && (PathPrefix(`/api`) || PathPrefix(`/media`) || Path(`/health`))
+      - traefik.http.routers.agroseason-api.priority=10
+      - traefik.http.routers.agroseason-api.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}
+      - traefik.http.routers.agroseason-api.tls=true
+      - traefik.http.routers.agroseason-api.tls.certresolver=${TRAEFIK_CERTRESOLVER:?set TRAEFIK_CERTRESOLVER}
+      - traefik.http.services.agroseason-api.loadbalancer.server.port=8000
+  worker:
+    networks: [internal, edge]
+  web:
+    networks: [traefik_public]
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=${TRAEFIK_NETWORK}
+      - traefik.http.routers.agroseason-web.rule=Host(`${DOMAIN}`)
+      - traefik.http.routers.agroseason-web.priority=1
+      - traefik.http.routers.agroseason-web.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}
+      - traefik.http.routers.agroseason-web.tls=true
+      - traefik.http.routers.agroseason-web.tls.certresolver=${TRAEFIK_CERTRESOLVER}
+      - traefik.http.services.agroseason-web.loadbalancer.server.port=8080
+
+networks:
+  traefik_public:
+    external: true
+    name: ${TRAEFIK_NETWORK:?set TRAEFIK_NETWORK}

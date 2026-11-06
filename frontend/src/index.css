@@ -1,0 +1,37 @@
+@import "tailwindcss";
+
+/* Strict two-colour palette: dark green #166534 and white #FFFFFF. Tints use opacity only. */
+@theme {
+  --color-*: initial;
+  --color-brand: #166534;
+  --color-paper: #ffffff;
+  --shadow-*: initial;
+  --font-sans: "Noto Sans Tamil", "Noto Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+@layer base {
+  html { color: #166534; background: #ffffff; }
+  body { margin: 0; font-family: var(--font-sans); }
+  :focus-visible { outline: 3px solid #166534; outline-offset: 2px; }
+  ::selection { background: #166534; color: #ffffff; }
+  input, select, button { font: inherit; color: inherit; }
+}
+
+/* Patterns replace extra colours: hatched = documented but not verified */
+.pattern-hatch {
+  background-color: #ffffff;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8'%3E%3Cpath d='M-1 1l2-2M0 8l8-8M7 9l2-2' stroke='%23166534' stroke-width='1.5'/%3E%3C/svg%3E");
+}
+.pattern-dots {
+  background-color: #ffffff;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='6' height='6'%3E%3Ccircle cx='3' cy='3' r='1' fill='%23166534'/%3E%3C/svg%3E");
+}
+
+@layer components {
+  .input { border: 2px solid #166534; background: #ffffff; padding: 0.5rem 0.75rem; min-height: 44px; width: 100%; }
+  .btn-primary { background: #166534; color: #ffffff; border: 2px solid #166534; padding: 0.5rem 1rem; min-height: 44px; font-weight: 700; cursor: pointer; }
+  .btn-primary:hover:not(:disabled) { background: #ffffff; color: #166534; }
+  .btn-secondary { background: #ffffff; color: #166534; border: 2px solid #166534; padding: 0.4rem 0.9rem; min-height: 40px; font-weight: 600; cursor: pointer; }
+  .btn-secondary:hover:not(:disabled) { background: #166534; color: #ffffff; }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+}
