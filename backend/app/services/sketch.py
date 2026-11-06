@@ -20,7 +20,7 @@ from app.services import costcontrol, safenet
 
 KINDS = ("produce", "plant", "seed", "seedling", "stage")
 KIND_QUERY = {"produce": "", "plant": "plant", "seed": "seeds", "seedling": "seedling", "stage": "growth stage"}
-IMAGE_HOSTS = {"upload.wikimedia.org"}
+IMAGE_HOSTS = {"upload.wikimedia.org", "thumb.wikimedia.org"}
 COMMONS_API = "https://commons.wikimedia.org/w/api.php"
 ALLOWED_LICENSE = re.compile(r"^(cc0|public domain|pd\b|cc[- ]by(-sa)?[- ][1-4]\.\d)", re.I)
 MIN_DIM, MAX_DIM = 200, 8000
@@ -76,7 +76,7 @@ def commons_license(file_title: str, client: httpx.Client | None = None) -> dict
     """Look up a Wikimedia Commons file; return license/attribution info only for reusable licenses."""
     s = get_settings()
     own = client is None
-    client = client or httpx.Client(timeout=s.http_timeout_seconds)
+    client = client or httpx.Client(timeout=s.http_timeout_seconds, headers={"User-Agent": safenet.USER_AGENT})
     try:
         r = client.get(COMMONS_API, params={
             "action": "query", "titles": file_title, "prop": "imageinfo", "format": "json",

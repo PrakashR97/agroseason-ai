@@ -89,3 +89,11 @@ def test_no_stack_trace_leak(client, monkeypatch):
     def boom(): raise RuntimeError("secret internals")
     r = TestClient(app, raise_server_exceptions=False).get("/boom")
     assert r.status_code == 500 and "secret" not in r.text
+
+
+def test_sketch_image_hosts_are_wikimedia_only():
+    from app.services import sketch
+    assert sketch.IMAGE_HOSTS == {"upload.wikimedia.org", "thumb.wikimedia.org"}
+    safenet.validate_public_url("https://thumb.wikimedia.org/a.jpg", allowed_hosts=sketch.IMAGE_HOSTS)
+    with pytest.raises(safenet.UnsafeURL):
+        safenet.validate_public_url("https://evilwikimedia.org/a.jpg", allowed_hosts=sketch.IMAGE_HOSTS)

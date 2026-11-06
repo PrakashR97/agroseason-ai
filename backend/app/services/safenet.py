@@ -10,6 +10,10 @@ import httpx
 from app.config import get_settings
 
 
+# Wikimedia and many institutions reject requests without a descriptive User-Agent.
+USER_AGENT = "AgroSeasonAI/1.0 (+https://github.com/PrakashR97/agroseason-ai; agricultural research bot)"
+
+
 class UnsafeURL(Exception):
     pass
 
@@ -49,7 +53,7 @@ def safe_get(url: str, *, max_bytes: int | None = None, content_types: tuple[str
     cap = max_bytes or s.max_download_bytes
     own = client is None
     client = client or httpx.Client(timeout=s.http_timeout_seconds, follow_redirects=False,
-                                    headers={"User-Agent": "AgroSeasonAI/1.0 (research bot)"})
+                                    headers={"User-Agent": USER_AGENT})
     try:
         for _ in range(max_redirects + 1):
             validate_public_url(url, allowed_hosts)

@@ -106,3 +106,21 @@ def test_sketch_api_not_configured_does_not_queue(client, db):
     cid = db.query(Crop).filter_by(slug="pumpkin").one().id
     r = client.get(f"/api/sketches/{cid}", params={"generate": "true"}).json()
     assert r["job_id"] is None and "not configured" in r["reason"]
+
+
+def test_commons_requests_send_user_agent():
+    import httpx
+    seen = {}
+
+    def handler(req):
+        seen["ua"] = req.headers.get("user-agent", "")
+        if "AgroSeasonAI" not in seen["ua"]:
+            return httpx.Response(403, text="Please set a user-agent")
+        return httpx.Response(200, json={"query": {"pages": {"1": {"imageinfo": [{
+            "thumburl": "https://upload.wikimedia.org/x.jpg", "descriptionurl": "https://commons.wikimedia.org/wiki/File:x.jpg",
+            "mime": "image/jpeg", "extmetadata": {"LicenseShortName": {"value": "CC BY-SA 4.0"}, "Artist": {"value": "<a>Jo</a>"}}}]}}}})
+
+    from app.services import safenet
+    c = httpx.Client(transport=httpx.MockTransport(handler), headers={"User-Agent": safenet.USER_AGENT})
+    info = sketch.commons_license("File:x.jpg", client=c)
+    assert info and info["attribution"] == "Jo, CC BY-SA 4.0, via Wikimedia Commons"
