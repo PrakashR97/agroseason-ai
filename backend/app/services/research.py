@@ -35,7 +35,13 @@ NON_GUIDANCE_URL = re.compile(
 MIN_CROP_MENTIONS = 3
 
 
+REDIRECTOR_HOSTS = ("google.com", "google.co.in", "bing.com", "t.co", "bit.ly", "goo.gl", "facebook.com", "l.facebook.com")
+
+
 def is_guidance_url(url: str, title: str = "") -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    if any(host == h or host.endswith("." + h) for h in REDIRECTOR_HOSTS):
+        return False  # search-engine/shortener redirects hide the real publisher
     return not NON_GUIDANCE_URL.search(url + " " + title)
 
 
@@ -44,6 +50,36 @@ def crop_mention_count(crop: Crop, text: str) -> int:
     names = {normalize(crop.name_en), normalize(crop.name_ta)} | {normalize(a.alias) for a in crop.aliases if a.lang != "tanglish"}
     names.discard("")
     return sum(t.count(n) for n in names)
+
+
+_MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6, "jul": 7, "aug": 8, "sep": 9,
+           "oct": 10, "nov": 11, "dec": 12}
+_MONTH_RE = re.compile(r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|"
+                       r"sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b\.?", re.I)
+_RANGE_JOIN = re.compile(r"^\s*(?:-|–|—|to|through|upto|up to|till|until)\s*$", re.I)
+
+
+def parse_month_ranges(text: str) -> list[tuple[int, int]]:
+    """'May - June and November – December' -> [(5, 6), (11, 12)]. Only explicit month names are used."""
+    found = [(m.start(), m.end(), _MONTHS[m.group(1)[:3].lower()]) for m in _MONTH_RE.finditer(text or "")]
+    out: list[tuple[int, int]] = []
+    i = 0
+    while i < len(found):
+        start = found[i][2]
+        if i + 1 < len(found) and _RANGE_JOIN.match(text[found[i][1]:found[i + 1][0]]):
+            out.append((start, found[i + 1][2]))
+            i += 2
+        else:
+            out.append((start, start))
+            i += 1
+    return list(dict.fromkeys(out))
+
+
+_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def window_label(a: int, b: int) -> str:
+    return _ABBR[a - 1] if a == b else f"{_ABBR[a - 1]}–{_ABBR[b - 1]}"
 
 
 def is_trusted_domain(host: str) -> bool:
@@ -155,7 +191,8 @@ SYSTEM_PROMPT = (
     "\"seasons\": [{\"season_name\": str, \"sow_start_month\": int|null, \"sow_end_month\": int|null, "
     "\"harvest_start_month\": int|null, \"harvest_end_month\": int|null, \"duration_days_min\": int|null, "
     "\"duration_days_max\": int|null, \"district\": str|null, \"general_guidance\": bool, \"evidence_quote\": str}]}. "
-    "Months are integers 1-12. Allowed field_key values: " + ", ".join(SECTION_KEYS) + "."
+    "Months are integers 1-12. For sowing_seasons and harvest_seasons keep the month names exactly as written "
+    "in the document. Allowed field_key values: " + ", ".join(SECTION_KEYS) + "."
 )
 
 
@@ -192,80 +229,101 @@ def run_research(db: Session, job: ResearchJob, *, serper=None, llm=None, fetch=
     llm = llm or providers.get_llm()
 
     scope = f" {district.name_en} district" if district else ""
+    name_words = [w for w in normalize(crop.name_en).split() if len(w) > 3]
     queries = [
-        f"{crop.name_en} cultivation practices Tamil Nadu{scope} sowing season TNAU",
-        f"{crop.name_en} {crop.scientific_name or ''} package of practices site:agritech.tnau.ac.in OR site:tnau.ac.in OR site:icar.gov.in",
+        f"site:agritech.tnau.ac.in {crop.name_en} {crop.scientific_name or ''} crop production sowing season soil",
+        f"{crop.name_en} cultivation practices Tamil Nadu{scope} sowing season TNAU ICAR",
     ]
-    results: list[dict] = []
-    for q in queries:
-        costcontrol.ensure_budget(db, "serper")
-        results.extend(serper.search(q.strip(), num=6))
-        costcontrol.record_usage(db, "serper", "search", job_id=job.id)
-
-    seen, candidates = set(), []
+    seen: set[str] = set()
     skipped: list[str] = []
-    for r in results:
-        url = r.get("link") or ""
-        host = (urlparse(url).hostname or "").lower()
-        if not host or url in seen:
-            continue
-        seen.add(url)
-        if not is_guidance_url(url, r.get("title") or ""):
-            skipped.append(f"{url}: not agronomic guidance")
-            continue
-        candidates.append((0 if is_trusted_domain(host) else 1, url, r.get("title") or url))
-    candidates.sort(key=lambda c: c[0])
-
     collected_fields: list[dict] = []
     collected_seasons: list[dict] = []
     used_sources: list[dict] = []
-    for _, url, title in candidates[:4]:
-        try:
-            body, ctype = fetch(url)
-            text = extract_text(body, ctype)
-        except Exception as e:  # unreachable / unsafe / unparsable pages are skipped, not fatal
-            skipped.append(f"{url}: {type(e).__name__}")
-            continue
-        if len(text) < 200 or crop_mention_count(crop, text) < MIN_CROP_MENTIONS:
-            skipped.append(f"{url}: not relevant")
-            continue
-        costcontrol.ensure_budget(db, "openai")
-        user = (f"Crop: {crop.name_en} ({crop.scientific_name}). Requested district: "
-                f"{district.name_en if district else 'Tamil Nadu (state level)'}.\n\nDOCUMENT:\n{text}")
-        data, tin, tout = llm.extract_json(SYSTEM_PROMPT, user)
-        costcontrol.record_usage(db, "openai", "extract", tin, tout, job.id)
-        host = (urlparse(url).hostname or "").lower()
-        src = db.scalar(select(ResearchSource).where(ResearchSource.url == url))
-        if src is None:
-            src = ResearchSource(url=url[:1000], title=title[:500], domain=host, publisher=host,
-                                 is_trusted=is_trusted_domain(host))
-            db.add(src)
-        src.retrieved_at = utcnow()
-        src.content_hash = hashlib.sha256(text.encode()).hexdigest()
-        db.flush()
-        used_sources.append({"id": src.id, "url": url, "title": title, "trusted": src.is_trusted})
-        if not data.get("crop_matches", False):
-            continue
-        for f in data.get("fields", []) or []:
-            f["_src"] = src.id
-            f["_trusted"] = src.is_trusted
-            f["_valid"] = (f.get("general_guidance") is True and f.get("field_key") in SECTION_KEYS and bool(f.get("value")) and
-                           quote_in_text(str(f.get("evidence_quote", "")), text) and
-                           numbers_supported(str(f.get("value")), str(f.get("evidence_quote", ""))))
-            collected_fields.append(f)
-        for s in data.get("seasons", []) or []:
-            s["_src"] = src.id
-            s["_trusted"] = src.is_trusted
-            s["_valid"] = s.get("general_guidance") is True and bool(s.get("season_name")) and quote_in_text(str(s.get("evidence_quote", "")), text)
-            collected_seasons.append(s)
+    useful_docs = 0
+    docs_tried = 0
+
+    for qi, q in enumerate(queries):
+        # Query 2 (broader) only runs when the targeted TNAU query produced no useful trusted document.
+        if useful_docs >= 1:
+            break
+        costcontrol.ensure_budget(db, "serper")
+        results = serper.search(q.strip(), num=6)
+        costcontrol.record_usage(db, "serper", "search", job_id=job.id)
+
+        candidates = []
+        for r in results:
+            url = r.get("link") or ""
+            host = (urlparse(url).hostname or "").lower()
+            if not host or url in seen:
+                continue
+            seen.add(url)
+            if not is_guidance_url(url, r.get("title") or ""):
+                skipped.append(f"{url[:120]}: not agronomic guidance")
+                continue
+            rank = (0 if is_trusted_domain(host) else 2) + (
+                0 if any(w in normalize(url + " " + (r.get("title") or "")) for w in name_words) else 1)
+            candidates.append((rank, url, r.get("title") or url))
+        candidates.sort(key=lambda c: c[0])
+
+        for _, url, title in candidates:
+            if useful_docs >= 2 or docs_tried >= 4:
+                break  # enough good documents; avoid extra paid extractions
+            try:
+                body, ctype = fetch(url)
+                text = extract_text(body, ctype)
+            except Exception as e:  # unreachable / unsafe / unparsable pages are skipped, not fatal
+                skipped.append(f"{url[:120]}: {type(e).__name__}")
+                continue
+            if len(text) < 200 or crop_mention_count(crop, text) < MIN_CROP_MENTIONS:
+                skipped.append(f"{url[:120]}: not relevant")
+                continue
+            docs_tried += 1
+            costcontrol.ensure_budget(db, "openai")
+            user = (f"Crop: {crop.name_en} ({crop.scientific_name}). Requested district: "
+                    f"{district.name_en if district else 'Tamil Nadu (state level)'}.\n\nDOCUMENT:\n{text}")
+            data, tin, tout = llm.extract_json(SYSTEM_PROMPT, user)
+            costcontrol.record_usage(db, "openai", "extract", tin, tout, job.id)
+            host = (urlparse(url).hostname or "").lower()
+            src = db.scalar(select(ResearchSource).where(ResearchSource.url == url))
+            if src is None:
+                src = ResearchSource(url=url[:1000], title=title[:500], domain=host, publisher=host,
+                                     is_trusted=is_trusted_domain(host))
+                db.add(src)
+            src.retrieved_at = utcnow()
+            src.content_hash = hashlib.sha256(text.encode()).hexdigest()
+            db.flush()
+            used_sources.append({"id": src.id, "url": url, "title": title, "trusted": src.is_trusted})
+            if not data.get("crop_matches", False):
+                continue
+            doc_valid = 0
+            for f in data.get("fields", []) or []:
+                f["_src"] = src.id
+                f["_trusted"] = src.is_trusted
+                f["_valid"] = (f.get("general_guidance") is True and f.get("field_key") in SECTION_KEYS
+                               and bool(f.get("value")) and quote_in_text(str(f.get("evidence_quote", "")), text)
+                               and numbers_supported(str(f.get("value")), str(f.get("evidence_quote", ""))))
+                doc_valid += bool(f["_valid"])
+                collected_fields.append(f)
+            for s in data.get("seasons", []) or []:
+                s["_src"] = src.id
+                s["_trusted"] = src.is_trusted
+                s["_valid"] = (s.get("general_guidance") is True and bool(s.get("season_name"))
+                               and quote_in_text(str(s.get("evidence_quote", "")), text))
+                collected_seasons.append(s)
+            if src.is_trusted and doc_valid:
+                useful_docs += 1
 
     return _store(db, job, crop, district, collected_fields, collected_seasons, used_sources, skipped)
+
+
+STATE_LEVEL_NAMES = {"tamil nadu", "tamilnadu", "tn", "state", "all", "all districts", "statewide", "india",
+                     "all tamil nadu", "tamil nadu state", "not specified", "none", "null", "na", "n a"}
 
 
 def _applies(item: dict, district: District | None) -> str | None:
     """Return 'district' | 'state' | None (not applicable to the requested district)."""
     d = item.get("district")
-    if not d:
+    if not d or normalize(str(d)) in STATE_LEVEL_NAMES:
         return "state"
     if district and normalize(str(d)) == normalize(district.name_en):
         return "district"
@@ -283,7 +341,8 @@ def _store(db: Session, job, crop, district, fields, seasons, used_sources, skip
             source_id=f["_src"], crop_id=crop.id, district_id=district.id if district else None,
             job_id=job.id, field_key=str(f.get("field_key"))[:64], extracted_value=str(f.get("value", "")),
             evidence_quote=str(f.get("evidence_quote", "")),
-            applicability={"district": f.get("district"), "season": f.get("season"), "variety": f.get("variety")},
+            applicability={"district": f.get("district"), "season": f.get("season"), "variety": f.get("variety"),
+                           "general_guidance": f.get("general_guidance")},
             quote_validated=f["_valid"], status=(VERIFIED if f["_valid"] and f["_trusted"] else REVIEW_REQUIRED)))
     db.flush()
 
@@ -380,6 +439,9 @@ def _store(db: Session, job, crop, district, fields, seasons, used_sources, skip
         row.notes = "Conflicting sources; review required." if conflict else None
         season_count += 1
 
+    if season_count == 0:
+        season_count += _derive_seasons(db, crop, district, groups)
+
     n_valid = sum(1 for f in fields if f["_valid"]) + sum(1 for s in seasons if s["_valid"])
     if verified_n or any(s["_trusted"] and s["_valid"] for s in seasons):
         status = "completed"
@@ -399,6 +461,55 @@ def _store(db: Session, job, crop, district, fields, seasons, used_sources, skip
                                    "sources": len(used_sources)}, status)
     db.commit()
     return result
+
+
+def _derive_seasons(db: Session, crop, district, groups) -> int:
+    """Create calendar season rows from VALIDATED sowing/harvest text using the deterministic month parser."""
+    made = 0
+    for sc in ("district", "state"):
+        sow_items = groups.get((sc, "sowing_seasons"))
+        if not sow_items:
+            continue
+        harv_items = groups.get((sc, "harvest_seasons"))
+        sow_sets = {tuple(parse_month_ranges(str(i["value"]))) for i in sow_items}
+        sow_sets.discard(())
+        if not sow_sets:
+            continue
+        conflict = len(sow_sets) > 1
+        sow = list(next(iter(sow_sets)))
+        harvest: list[tuple[int, int]] = []
+        if harv_items:
+            hsets = {tuple(parse_month_ranges(str(i["value"]))) for i in harv_items}
+            hsets.discard(())
+            if len(hsets) == 1:
+                harvest = list(next(iter(hsets)))
+            elif len(hsets) > 1:
+                conflict = True
+        paired = harvest if len(harvest) == len(sow) else []
+        trusted = any(i["_trusted"] for i in sow_items)
+        did = district.id if (sc == "district" and district) else None
+        for idx, (a, b) in enumerate(sow):
+            name = window_label(a, b)
+            row = db.scalar(select(CropDistrictSeason).where(
+                CropDistrictSeason.crop_id == crop.id, CropDistrictSeason.season_name == name,
+                CropDistrictSeason.irrigation == "any", CropDistrictSeason.variety_id.is_(None),
+                CropDistrictSeason.district_id.is_(None) if did is None else CropDistrictSeason.district_id == did))
+            status = VERIFIED if (trusted and not conflict) else REVIEW_REQUIRED
+            if row and row.verification_status == VERIFIED and status != VERIFIED:
+                continue
+            if row is None:
+                row = CropDistrictSeason(crop_id=crop.id, district_id=did, season_name=name)
+                db.add(row)
+            row.sow_start_month, row.sow_end_month = a, b
+            if paired:
+                row.harvest_start_month, row.harvest_end_month = paired[idx]
+            row.verification_status = status
+            row.source_id = sow_items[0]["_src"]
+            row.notes = ("Conflicting sources; review required." if conflict else
+                         "Months parsed from the cited source text." + ("" if paired else " Harvest months not stated for this window."))
+            made += 1
+    db.flush()
+    return made
 
 
 def process_job(db: Session, job_id: str, **kw) -> ResearchJob | None:

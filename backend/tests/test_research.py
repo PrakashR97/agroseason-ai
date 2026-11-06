@@ -64,7 +64,7 @@ def test_pipeline_validates_against_source(db):
     season = db.query(CropDistrictSeason).filter_by(crop_id=crop.id, district_id=d.id).one()
     assert (season.verification_status, season.sow_start_month, season.sow_end_month) == ("verified", 10, 11)
     assert db.query(ApiUsageLog).filter_by(provider="openai").count() >= 1
-    assert db.query(ApiUsageLog).filter_by(provider="serper").count() == 2
+    assert db.query(ApiUsageLog).filter_by(provider="serper").count() == 1
 
 
 def test_untrusted_source_is_review_required(db):
@@ -205,3 +205,87 @@ def test_barely_mentioned_crop_skipped(db):
     research.run_research(db, job, serper=FakeSerper(["https://tnau.ac.in/crop/t"]), llm=llm,
                           fetch=lambda u: (page.encode(), "text/html"))
     assert llm.calls == 0
+
+
+def test_parse_month_ranges():
+    p = research.parse_month_ranges
+    assert p("May - June and November – December") == [(5, 6), (11, 12)]
+    assert p("Sow in October to November") == [(10, 11)]
+    assert p("Dec-Jan") == [(12, 1)]
+    assert p("June, July") == [(6, 6), (7, 7)]
+    assert p("Sept. to Oct.") == [(9, 10)]
+    assert p("twenty days after sowing") == []
+    assert p("the 70th day") == []
+
+
+SEASON_PAGE = ("<html><body><p>" + "Tomato is grown widely in Tamil Nadu. " * 8 +
+               "Season: May - June and November – December for sowing tomato. "
+               "Harvest begins August - September and February - March in tomato.</p></body></html>")
+
+
+def test_structured_months_from_validated_text(db):
+    crop, d, job = mkjob(db, "salem")
+    payload = {"crop_matches": True, "seasons": [], "fields": [
+        {"field_key": "sowing_seasons", "value": "May - June and November – December", "general_guidance": True,
+         "evidence_quote": "Season: May - June and November – December for sowing tomato."},
+        {"field_key": "harvest_seasons", "value": "August - September and February - March", "general_guidance": True,
+         "evidence_quote": "Harvest begins August - September and February - March in tomato."}]}
+    research.run_research(db, job, serper=FakeSerper(["https://agritech.tnau.ac.in/horticulture/tomato.html"]),
+                          llm=FakeLLM(payload), fetch=lambda u: (SEASON_PAGE.encode(), "text/html"))
+    rows = db.query(CropDistrictSeason).filter_by(crop_id=crop.id, district_id=None).order_by(CropDistrictSeason.sow_start_month).all()
+    got = [(r.season_name, r.sow_start_month, r.sow_end_month, r.harvest_start_month, r.harvest_end_month, r.verification_status) for r in rows]
+    assert got == [("May–Jun", 5, 6, 8, 9, "verified"), ("Nov–Dec", 11, 12, 2, 3, "verified")]
+    assert job.status == "completed"
+    from app.services.calendar import build_calendar
+    cal = build_calendar(db, crop, None, 11)
+    assert cal["selected_month"]["suitability"] == "recommended" and cal["scope"] == "state"
+
+
+def test_untrusted_months_are_review_required(db):
+    crop, d, job = mkjob(db)
+    payload = {"crop_matches": True, "seasons": [], "fields": [
+        {"field_key": "sowing_seasons", "value": "May - June", "general_guidance": True,
+         "evidence_quote": "Season: May - June and November – December for sowing tomato."}]}
+    research.run_research(db, job, serper=FakeSerper(["https://blog.example.com/crop/tomato"]), llm=FakeLLM(payload),
+                          fetch=lambda u: (SEASON_PAGE.encode(), "text/html"))
+    r = db.query(CropDistrictSeason).filter_by(crop_id=crop.id).one()
+    assert r.verification_status == "review_required"
+
+
+def test_targeted_query_saves_second_search(db):
+    crop, d, job = mkjob(db)
+    serper = FakeSerper(["https://agritech.tnau.ac.in/horticulture/tomato_a.html", "https://agritech.tnau.ac.in/horticulture/tomato_b.html"])
+    research.run_research(db, job, serper=serper, llm=FakeLLM(GOOD), fetch=fetcher)
+    assert serper.calls == 1                      # first (targeted) query already gave a useful trusted document
+    crop2, d2, job2 = mkjob(db, "namakkal")
+    serper2 = FakeSerper(["https://blog.example.com/tomato"])
+    research.run_research(db, job2, serper=serper2, llm=FakeLLM(GOOD), fetch=fetcher)
+    assert serper2.calls == 2                     # falls back to the broader query
+
+
+def test_stops_after_two_useful_documents(db):
+    crop, d, job = mkjob(db)
+    links = [f"https://agritech.tnau.ac.in/horticulture/tomato_{i}.html" for i in range(4)]
+    llm = FakeLLM(GOOD)
+    research.run_research(db, job, serper=FakeSerper(links), llm=llm, fetch=fetcher)
+    assert llm.calls == 2
+    assert research.is_trusted_domain('agritech.tnau.ac.in')
+
+
+def test_redirector_links_rejected():
+    assert not research.is_guidance_url("https://www.google.com/goto?url=abc")
+    assert not research.is_guidance_url("https://bit.ly/x")
+    assert research.is_guidance_url("https://agritech.tnau.ac.in/horticulture/tomato.html")
+
+
+def test_state_level_district_label_is_kept(db):
+    crop, d, job = mkjob(db)
+    payload = {"crop_matches": True, "seasons": [], "fields": [
+        {"field_key": "soil", "value": "Well drained red loam, pH 6.0 to 7.0", "general_guidance": True, "district": "Tamil Nadu",
+         "evidence_quote": "Tomato requires well drained red loam soil with pH 6.0 to 7.0 for best growth."},
+        {"field_key": "climate", "value": "Warm season crop", "general_guidance": True, "district": "Madurai",
+         "evidence_quote": "Tomato is a warm season crop grown widely."}]}
+    research.run_research(db, job, serper=FakeSerper(["https://agritech.tnau.ac.in/horticulture/t.html"]),
+                          llm=FakeLLM(payload), fetch=fetcher)
+    g = db.query(CultivationGuide).filter_by(crop_id=crop.id).one()
+    assert "soil" in g.sections and "climate" not in g.sections   # other district's fact is not applied to Salem
